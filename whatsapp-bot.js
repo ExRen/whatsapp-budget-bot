@@ -134,6 +134,27 @@ function parseCommand(text) {
     return { type: 'QUERY_WEEKLY' }
   }
   
+  // Bill reminder command: !ingatkan listrik 20
+  if (lower.startsWith('!ingatkan ')) {
+    const parts = text.slice(10).trim().split(/\s+/)
+    const day = parseInt(parts.pop())
+    const name = parts.join(' ')
+    if (name && day >= 1 && day <= 31) {
+      return { type: 'ADD_REMINDER', data: { name, day } }
+    }
+  }
+  
+  // List reminders
+  if (lower === '!reminder' || lower === '!reminders') {
+    return { type: 'LIST_REMINDERS' }
+  }
+  
+  // Delete reminder
+  if (lower.startsWith('!hapus-reminder ')) {
+    const num = parseInt(lower.slice(16).trim())
+    return { type: 'DELETE_REMINDER', index: num }
+  }
+  
   // Multi-transaction: Check if contains comma (e.g., "makan 25k, bensin 50k")
   if (text.includes(',')) {
     const parts = text.split(',').map(p => p.trim()).filter(p => p)
@@ -224,7 +245,8 @@ function parseCommand(text) {
 // =====================================
 // SESSION MANAGEMENT
 // =====================================
-const activeSessions = new Map() // phone -> { userId, email, fullName, alertEnabled }
+const activeSessions = new Map() // phone -> { userId, email, fullName, alertEnabled, lastTransaction }
+const userReminders = new Map() // phone -> [{ name, day, createdAt }]
 
 // =====================================
 // HELPER FUNCTIONS
@@ -357,6 +379,8 @@ const HELP_MESSAGE = `
 • \`!stats\` - Statistik XP & Level 🎮
 • \`!undo\` - Batalkan transaksi terakhir ↩️
 • \`!hapus <nomor>\` - Hapus transaksi hari ini
+• \`!ingatkan <tagihan> <tgl>\` - Reminder tagihan 🔔
+• \`!reminder\` - Lihat daftar reminder
 • \`!alert on/off\` - Notifikasi budget
 • \`!help\` - Bantuan
 
@@ -364,6 +388,8 @@ const HELP_MESSAGE = `
 • "Makan 25k" (auto kategori)
 • "Kado 50k #7" (manual: #7 = Lainnya)
 • "Makan 25k, bensin 50k" (multi!)
+• 🎤 Voice note _(coming soon)_
+• 📷 Foto struk _(coming soon)_
 
 *Query:*
 • "Sisa budget?"
@@ -438,6 +464,34 @@ client.on('message', async (message) => {
   if (!ALLOWED_PHONES.includes(phone)) {
     console.log(`🚫 Blocked: ${phone} (not in whitelist)`)
     return // Silently ignore non-whitelisted numbers
+  }
+  
+  // === VOICE NOTE HANDLER ===
+  if (message.type === 'ptt' || message.type === 'audio') {
+    const session = activeSessions.get(phone)
+    if (session) {
+      console.log(`🎤 Voice note from ${phone}`)
+      await message.reply(
+        `🎤 *Voice Note Diterima!*\n\n` +
+        `Fitur transcribe voice → transaksi akan segera hadir!\n\n` +
+        `_Sementara ini, ketik manual ya._`
+      )
+    }
+    return
+  }
+  
+  // === IMAGE HANDLER ===
+  if (message.type === 'image') {
+    const session = activeSessions.get(phone)
+    if (session) {
+      console.log(`📷 Image from ${phone}`)
+      await message.reply(
+        `📷 *Foto Diterima!*\n\n` +
+        `Fitur OCR struk → auto-extract transaksi akan segera hadir!\n\n` +
+        `_Sementara ini, ketik manual ya._`
+      )
+    }
+    return
   }
   
   console.log(`📩 [${phone}]: ${text}`)
@@ -857,6 +911,57 @@ client.on('message', async (message) => {
         `✨ *+${totalXP} XP*`
       )
     }
+    // === ADD REMINDER ===
+    else if (command.type === 'ADD_REMINDER') {
+      const { name, day } = command.data
+      
+      if (!userReminders.has(phone)) {
+        userReminders.set(phone, [])
+      }
+      
+      const reminders = userReminders.get(phone)
+      reminders.push({ name, day, createdAt: new Date() })
+      userReminders.set(phone, reminders)
+      
+      await message.reply(
+        `🔔 *Reminder Ditambahkan!*\n\n` +
+        `📝 ${name}\n` +
+        `📅 Setiap tanggal ${day}\n\n` +
+        `_Kamu akan diingatkan jam 8 pagi._`
+      )
+    }
+    // === LIST REMINDERS ===
+    else if (command.type === 'LIST_REMINDERS') {
+      const reminders = userReminders.get(phone) || []
+      
+      if (reminders.length === 0) {
+        await message.reply('📋 *Daftar Reminder*\n\n_Belum ada reminder._\n\nTambah dengan: `!ingatkan listrik 20`')
+        return
+      }
+      
+      let list = `📋 *Daftar Reminder*\n\n`
+      reminders.forEach((r, i) => {
+        list += `${i + 1}. ${r.name} (tgl ${r.day})\n`
+      })
+      list += `\n_Hapus dengan: \`!hapus-reminder <nomor>\`_`
+      
+      await message.reply(list)
+    }
+    // === DELETE REMINDER ===
+    else if (command.type === 'DELETE_REMINDER') {
+      const reminders = userReminders.get(phone) || []
+      const index = command.index - 1
+      
+      if (index < 0 || index >= reminders.length) {
+        await message.reply(`❌ Nomor tidak valid. Gunakan 1-${reminders.length}.`)
+        return
+      }
+      
+      const deleted = reminders.splice(index, 1)[0]
+      userReminders.set(phone, reminders)
+      
+      await message.reply(`🗑️ Reminder "${deleted.name}" dihapus.`)
+    }
     else if (command.type === 'HELP') {
       await message.reply(HELP_MESSAGE)
     }
@@ -1077,11 +1182,91 @@ cron.schedule('0 8 * * *', async () => {
 })
 
 // =====================================
+// BILL REMINDER CHECK (CRON JOB)
+// =====================================
+// Run every day at 8:00 AM - check if today matches any reminder day
+cron.schedule('0 8 * * *', async () => {
+  const today = new Date().getDate() // Get day of month (1-31)
+  console.log(`⏰ Checking bill reminders for day ${today}...`)
+  
+  for (const [phone, reminders] of userReminders) {
+    for (const reminder of reminders) {
+      if (reminder.day === today) {
+        try {
+          await client.sendMessage(`${phone}@c.us`, 
+            `🔔 *Pengingat Tagihan*\n\n` +
+            `📝 *${reminder.name}*\n` +
+            `📅 Hari ini tanggal ${today}\n\n` +
+            `_Jangan lupa bayar ya!_ 💸`
+          )
+          console.log(`📣 Sent reminder: ${reminder.name} to ${phone}`)
+        } catch (error) {
+          console.error(`Reminder error for ${phone}:`, error)
+        }
+      }
+    }
+  }
+})
+
+// =====================================
+// DAILY SUMMARY (CRON JOB)
+// =====================================
+// Run every day at 9:00 PM (21:00)
+cron.schedule('0 21 * * *', async () => {
+  const today = new Date().toISOString().split('T')[0]
+  console.log(`⏰ Running daily summary for ${today}...`)
+  
+  for (const [phone, session] of activeSessions) {
+    if (!session.alertEnabled) continue
+    
+    try {
+      // Get today's transactions
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('nama_belanja, harga, kategori')
+        .eq('user_id', session.userId)
+        .eq('tanggal_transaksi', today)
+        .eq('type', 'expense')
+      
+      if (!txs || txs.length === 0) continue
+      
+      const total = txs.reduce((sum, t) => sum + Number(t.harga), 0)
+      
+      // Group by category
+      const byCategory = {}
+      txs.forEach(t => {
+        byCategory[t.kategori] = (byCategory[t.kategori] || 0) + Number(t.harga)
+      })
+      
+      let categoryList = ''
+      Object.entries(byCategory)
+        .sort((a, b) => b[1] - a[1])
+        .forEach(([cat, amt]) => {
+          categoryList += `• ${cat}: ${formatCurrency(amt)}\n`
+        })
+      
+      await client.sendMessage(`${phone}@c.us`, 
+        `📊 *Ringkasan Hari Ini*\n` +
+        `📅 ${today}\n\n` +
+        `📝 Transaksi: ${txs.length}\n` +
+        `💰 Total: *${formatCurrency(total)}*\n\n` +
+        `*Per Kategori:*\n${categoryList}\n` +
+        `_Selamat malam!_ 🌙`
+      )
+      console.log(`📊 Sent daily summary to ${phone}`)
+    } catch (error) {
+      console.error(`Daily summary error for ${phone}:`, error)
+    }
+  }
+})
+
+// =====================================
 // START BOT
 // =====================================
 console.log('\n🚀 Starting WhatsApp Budget Bot...')
 console.log('📁 Auth data:', './.wwebjs_auth')
-console.log('📊 Features: Chart, Export, Gamification, Smart Alerts')
+console.log('📊 Features: Chart, Export, Gamification, Smart Alerts, Reminders')
+console.log('⏰ Cron Jobs: Budget Alert (08:00), Reminders (08:00), Daily Summary (21:00)')
 console.log('')
 
 client.initialize()
