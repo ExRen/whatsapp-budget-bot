@@ -1,11 +1,26 @@
 import pkg from 'whatsapp-web.js'
-const { Client, LocalAuth } = pkg
+const { Client, LocalAuth, MessageMedia } = pkg
 
 import qrcode from 'qrcode-terminal'
 import { createClient } from '@supabase/supabase-js'
 import dotenv from 'dotenv'
+import ExcelJS from 'exceljs'
+import { ChartJSNodeCanvas } from 'chartjs-node-canvas'
+import cron from 'node-cron'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
 
 dotenv.config()
+
+// =====================================
+// CHART GENERATOR
+// =====================================
+const chartJSNodeCanvas = new ChartJSNodeCanvas({ 
+  width: 600, 
+  height: 400,
+  backgroundColour: 'white'
+})
 
 // =====================================
 // SUPABASE CLIENT
@@ -149,7 +164,7 @@ function parseCommand(text) {
 // =====================================
 // SESSION MANAGEMENT
 // =====================================
-const activeSessions = new Map() // phone -> { userId, username, fullName }
+const activeSessions = new Map() // phone -> { userId, email, fullName, alertEnabled }
 
 // =====================================
 // HELPER FUNCTIONS
@@ -162,6 +177,112 @@ const formatCurrency = (amount) => {
   }).format(amount)
 }
 
+// Generate Pie Chart image
+async function generatePieChart(categoryData) {
+  const labels = Object.keys(categoryData)
+  const data = Object.values(categoryData)
+  const colors = [
+    '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', 
+    '#9966FF', '#FF9F40', '#C9CBCF'
+  ]
+  
+  const configuration = {
+    type: 'pie',
+    data: {
+      labels,
+      datasets: [{
+        data,
+        backgroundColor: colors.slice(0, labels.length),
+        borderWidth: 2,
+        borderColor: '#fff'
+      }]
+    },
+    options: {
+      plugins: {
+        title: {
+          display: true,
+          text: 'Pengeluaran per Kategori',
+          font: { size: 18, weight: 'bold' }
+        },
+        legend: {
+          position: 'bottom'
+        }
+      }
+    }
+  }
+  
+  return await chartJSNodeCanvas.renderToBuffer(configuration)
+}
+
+// Generate Excel file
+async function generateExcel(transactions, period) {
+  const workbook = new ExcelJS.Workbook()
+  const sheet = workbook.addWorksheet('Transaksi')
+  
+  // Header
+  sheet.columns = [
+    { header: 'No', key: 'no', width: 5 },
+    { header: 'Tanggal', key: 'tanggal', width: 15 },
+    { header: 'Nama Belanja', key: 'nama', width: 30 },
+    { header: 'Kategori', key: 'kategori', width: 20 },
+    { header: 'Jumlah (Rp)', key: 'harga', width: 15 }
+  ]
+  
+  // Style header
+  sheet.getRow(1).font = { bold: true }
+  sheet.getRow(1).fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FF4F46E5' }
+  }
+  sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } }
+  
+  // Add data
+  transactions.forEach((t, i) => {
+    sheet.addRow({
+      no: i + 1,
+      tanggal: t.tanggal_transaksi,
+      nama: t.nama_belanja,
+      kategori: t.kategori,
+      harga: Number(t.harga)
+    })
+  })
+  
+  // Total row
+  const total = transactions.reduce((sum, t) => sum + Number(t.harga), 0)
+  const totalRow = sheet.addRow({
+    no: '',
+    tanggal: '',
+    nama: '',
+    kategori: 'TOTAL',
+    harga: total
+  })
+  totalRow.font = { bold: true }
+  
+  // Save to temp file
+  const fileName = `Laporan_${period?.tanggal_mulai || 'All'}_${period?.tanggal_selesai || 'Time'}.xlsx`
+  const filePath = path.join(os.tmpdir(), fileName)
+  await workbook.xlsx.writeFile(filePath)
+  
+  return { filePath, fileName }
+}
+
+// Calculate XP from transaction
+function calculateXP(harga) {
+  // 1 XP per 1000 rupiah, minimum 5 XP
+  return Math.max(5, Math.floor(harga / 1000))
+}
+
+// Get level from XP
+function getLevel(xp) {
+  if (xp < 100) return { level: 1, name: 'Pemula', nextXP: 100 }
+  if (xp < 300) return { level: 2, name: 'Pencatat', nextXP: 300 }
+  if (xp < 600) return { level: 3, name: 'Hemat Master', nextXP: 600 }
+  if (xp < 1000) return { level: 4, name: 'Budget Pro', nextXP: 1000 }
+  if (xp < 2000) return { level: 5, name: 'Finance Guru', nextXP: 2000 }
+  return { level: 6, name: 'Money Legend', nextXP: null }
+}
+
 const HELP_MESSAGE = `
 📱 *Budget Tracker Bot*
 
@@ -170,6 +291,10 @@ const HELP_MESSAGE = `
 • \`!logout\` - Logout
 • \`!kategori\` - Lihat daftar kategori
 • \`!hari\` - Transaksi hari ini
+• \`!chart\` - Grafik pengeluaran 📊
+• \`!export\` - Export Excel 📂
+• \`!stats\` - Statistik XP & Level 🎮
+• \`!alert on/off\` - Notifikasi budget
 • \`!help\` - Bantuan
 
 *Catat Transaksi:*
@@ -514,10 +639,219 @@ client.on('message', async (message) => {
 })
 
 // =====================================
+// ADDITIONAL COMMAND HANDLERS
+// =====================================
+
+// Handler for !chart command
+client.on('message', async (message) => {
+  if (message.type !== 'chat') return
+  if (message.from.includes('@g.us')) return
+  
+  const phone = message.from.replace('@c.us', '')
+  const text = message.body.trim().toLowerCase()
+  const session = activeSessions.get(phone)
+  
+  if (!session) return
+  
+  try {
+    // === COMMAND: !chart ===
+    if (text === '!chart' || text === '!grafik') {
+      await message.reply('⏳ Generating chart...')
+      
+      // Get active period
+      const { data: period } = await supabase
+        .from('budget_periods')
+        .select('tanggal_mulai, tanggal_selesai')
+        .eq('user_id', session.userId)
+        .eq('is_active', true)
+        .single()
+      
+      // Get transactions
+      let query = supabase
+        .from('transactions')
+        .select('harga, kategori')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+      
+      if (period) {
+        query = query
+          .gte('tanggal_transaksi', period.tanggal_mulai)
+          .lte('tanggal_transaksi', period.tanggal_selesai)
+      }
+      
+      const { data: txs } = await query
+      
+      if (!txs || txs.length === 0) {
+        await message.reply('❌ Belum ada data transaksi untuk chart.')
+        return
+      }
+      
+      // Group by category
+      const byCategory = {}
+      txs.forEach(t => {
+        byCategory[t.kategori] = (byCategory[t.kategori] || 0) + Number(t.harga)
+      })
+      
+      // Generate chart
+      const chartBuffer = await generatePieChart(byCategory)
+      const media = new MessageMedia('image/png', chartBuffer.toString('base64'), 'chart.png')
+      
+      await message.reply(media, undefined, { 
+        caption: `📊 *Grafik Pengeluaran*\n📅 ${period?.tanggal_mulai || 'Semua'} - ${period?.tanggal_selesai || 'Waktu'}` 
+      })
+    }
+    
+    // === COMMAND: !export ===
+    else if (text === '!export' || text.startsWith('!export ')) {
+      await message.reply('⏳ Generating Excel...')
+      
+      // Get active period
+      const { data: period } = await supabase
+        .from('budget_periods')
+        .select('tanggal_mulai, tanggal_selesai')
+        .eq('user_id', session.userId)
+        .eq('is_active', true)
+        .single()
+      
+      // Get transactions
+      let query = supabase
+        .from('transactions')
+        .select('tanggal_transaksi, nama_belanja, kategori, harga')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+        .order('tanggal_transaksi', { ascending: false })
+      
+      if (period) {
+        query = query
+          .gte('tanggal_transaksi', period.tanggal_mulai)
+          .lte('tanggal_transaksi', period.tanggal_selesai)
+      }
+      
+      const { data: txs } = await query
+      
+      if (!txs || txs.length === 0) {
+        await message.reply('❌ Belum ada data transaksi untuk export.')
+        return
+      }
+      
+      // Generate Excel
+      const { filePath, fileName } = await generateExcel(txs, period)
+      const media = MessageMedia.fromFilePath(filePath)
+      
+      await message.reply(media, undefined, { 
+        caption: `📂 *Laporan Transaksi*\n📊 ${txs.length} transaksi\n💰 Total: ${formatCurrency(txs.reduce((s,t) => s + Number(t.harga), 0))}` 
+      })
+      
+      // Cleanup temp file
+      fs.unlinkSync(filePath)
+    }
+    
+    // === COMMAND: !stats ===
+    else if (text === '!stats' || text === '!xp' || text === '!level') {
+      // Get user stats from database (or calculate from transactions)
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('harga')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+      
+      const totalTransactions = txs?.length || 0
+      const totalXP = txs?.reduce((sum, t) => sum + calculateXP(Number(t.harga)), 0) || 0
+      const levelInfo = getLevel(totalXP)
+      
+      const progressBar = levelInfo.nextXP 
+        ? '█'.repeat(Math.floor((totalXP / levelInfo.nextXP) * 10)) + '░'.repeat(10 - Math.floor((totalXP / levelInfo.nextXP) * 10))
+        : '██████████'
+      
+      await message.reply(
+        `🎮 *Statistik Gamifikasi*\n\n` +
+        `⭐ Level: *${levelInfo.level}* (${levelInfo.name})\n` +
+        `✨ XP: *${totalXP}*${levelInfo.nextXP ? ` / ${levelInfo.nextXP}` : ' (MAX)'}\n` +
+        `[${progressBar}]\n\n` +
+        `📝 Total Transaksi: ${totalTransactions}\n` +
+        `💡 _Setiap transaksi = XP!_`
+      )
+    }
+    
+    // === COMMAND: !alert on/off ===
+    else if (text === '!alert on') {
+      session.alertEnabled = true
+      activeSessions.set(phone, session)
+      await message.reply('🔔 *Notifikasi Budget AKTIF*\n\nKamu akan menerima peringatan jika budget hampir habis.')
+    }
+    else if (text === '!alert off') {
+      session.alertEnabled = false
+      activeSessions.set(phone, session)
+      await message.reply('🔕 *Notifikasi Budget NONAKTIF*')
+    }
+    
+  } catch (error) {
+    console.error('Command error:', error)
+  }
+})
+
+// =====================================
+// SMART ALERTS (CRON JOB)
+// =====================================
+// Run every day at 8:00 AM
+cron.schedule('0 8 * * *', async () => {
+  console.log('⏰ Running daily budget alert check...')
+  
+  for (const [phone, session] of activeSessions) {
+    if (!session.alertEnabled) continue
+    
+    try {
+      // Get active period
+      const { data: period } = await supabase
+        .from('budget_periods')
+        .select('budget_bulanan, tanggal_mulai, tanggal_selesai')
+        .eq('user_id', session.userId)
+        .eq('is_active', true)
+        .single()
+      
+      if (!period) continue
+      
+      // Get total spent
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('harga')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+        .gte('tanggal_transaksi', period.tanggal_mulai)
+        .lte('tanggal_transaksi', period.tanggal_selesai)
+      
+      const spent = txs?.reduce((sum, t) => sum + Number(t.harga), 0) || 0
+      const budget = Number(period.budget_bulanan)
+      const percentage = Math.round((spent / budget) * 100)
+      
+      // Send alert if > 80%
+      if (percentage >= 90) {
+        await client.sendMessage(`${phone}@c.us`, 
+          `🚨 *PERINGATAN BUDGET!*\n\n` +
+          `Budget kamu sudah terpakai *${percentage}%*!\n` +
+          `💰 Sisa: ${formatCurrency(budget - spent)}\n\n` +
+          `_Hemat-hemat ya!_ 💪`
+        )
+      } else if (percentage >= 80) {
+        await client.sendMessage(`${phone}@c.us`, 
+          `⚠️ *Hati-hati!*\n\n` +
+          `Budget sudah terpakai *${percentage}%*\n` +
+          `💰 Sisa: ${formatCurrency(budget - spent)}\n\n` +
+          `_Pertimbangkan pengeluaran berikutnya!_`
+        )
+      }
+    } catch (error) {
+      console.error(`Alert error for ${phone}:`, error)
+    }
+  }
+})
+
+// =====================================
 // START BOT
 // =====================================
 console.log('\n🚀 Starting WhatsApp Budget Bot...')
 console.log('📁 Auth data:', './.wwebjs_auth')
+console.log('📊 Features: Chart, Export, Gamification, Smart Alerts')
 console.log('')
 
 client.initialize()
