@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  wa-bot:
+    build: .
+    container_name: whatsapp-budget-bot
+    restart: unless-stopped
+    
+    # Environment variables
+    env_file:
+      - .env
+    
+    # Volume for WhatsApp session persistence
+    volumes:
+      - ./wwebjs_auth:/app/.wwebjs_auth
+    
+    # Memory limits for optimization
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "node", "-e", "console.log('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

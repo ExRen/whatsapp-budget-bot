@@ -528,12 +528,25 @@ const client = new Client({
     args: [
       '--no-sandbox', 
       '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',  // ADD THIS
-      '--disable-accelerated-2d-canvas',  // ADD THIS
-      '--no-first-run',  // ADD THIS
-      '--no-zygote',  // ADD THIS
-      '--single-process',  // ADD THIS (use with caution)
-      '--disable-gpu'  // ADD THIS
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--disable-software-rasterizer',
+      '--disable-features=AudioServiceOutOfProcess',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-component-update',
+      '--disable-default-apps',
+      '--disable-translate',
+      '--metrics-recording-only',
+      '--mute-audio',
+      '--no-default-browser-check',
+      '--autoplay-policy=no-user-gesture-required'
     ]
   }
 })
