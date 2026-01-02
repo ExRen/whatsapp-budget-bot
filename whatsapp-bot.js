@@ -170,6 +170,26 @@ function parseCommand(text) {
     return { type: 'FULL_RECAP' }
   }
   
+  // Daily challenge
+  if (lower === '!challenge' || lower === '!tantangan') {
+    return { type: 'DAILY_CHALLENGE' }
+  }
+  
+  // Budget health score
+  if (lower === '!health' || lower === '!kesehatan' || lower === '!score') {
+    return { type: 'BUDGET_HEALTH' }
+  }
+  
+  // Spending mood
+  if (lower === '!mood') {
+    return { type: 'SPENDING_MOOD' }
+  }
+  
+  // Random tip
+  if (lower === '!tips' || lower === '!tip') {
+    return { type: 'RANDOM_TIP' }
+  }
+  
   // Multi-transaction: Check if contains comma (e.g., "makan 25k, bensin 50k")
   if (text.includes(',')) {
     const parts = text.split(',').map(p => p.trim()).filter(p => p)
@@ -260,8 +280,93 @@ function parseCommand(text) {
 // =====================================
 // SESSION MANAGEMENT
 // =====================================
-const activeSessions = new Map() // phone -> { userId, email, fullName, alertEnabled, lastTransaction }
+const activeSessions = new Map() // phone -> { userId, email, fullName, alertEnabled, lastTransaction, dailyChallenge }
 const userReminders = new Map() // phone -> [{ name, day, createdAt }]
+
+// =====================================
+// GAMIFICATION DATA
+// =====================================
+const DAILY_CHALLENGES = [
+  { id: 1, text: "Hari ini jangan beli kopi/minuman manis!", category: "Makanan & Minuman", maxSpend: 0 },
+  { id: 2, text: "Hemat transport hari ini - jalan kaki atau nebeng!", category: "Transport", maxSpend: 10000 },
+  { id: 3, text: "No shopping day! Jangan belanja apapun.", category: null, maxSpend: 50000 },
+  { id: 4, text: "Masak sendiri hari ini, hemat makan luar!", category: "Makanan & Minuman", maxSpend: 30000 },
+  { id: 5, text: "Lifestyle freeze! Tidak ada pengeluaran hiburan.", category: "Lifestyle", maxSpend: 0 },
+  { id: 6, text: "Budget max 100rb hari ini!", category: null, maxSpend: 100000 },
+  { id: 7, text: "Tantangan hemat: maksimal 3 transaksi hari ini!", category: null, maxTx: 3 }
+]
+
+const FINANCE_TIPS = [
+  "💡 Sisihkan 20% gaji di awal bulan sebelum dipakai.",
+  "💡 Gunakan aturan 50/30/20: Kebutuhan/Keinginan/Tabungan.",
+  "💡 Tunggu 24 jam sebelum beli barang mahal.",
+  "💡 Catat setiap pengeluaran, sekecil apapun!",
+  "💡 Bawa bekal dari rumah untuk hemat makan siang.",
+  "💡 Review langganan bulanan, cancel yang tidak perlu.",
+  "💡 Gunakan promo dan cashback dengan bijak.",
+  "💡 Simpan uang receh, lama-lama jadi bukit!",
+  "💡 Bedakan BUTUH vs INGIN sebelum membeli.",
+  "💡 Set goal tabungan yang spesifik dan realistis."
+]
+
+const ACHIEVEMENTS = [
+  { id: 'first_tx', name: 'First Step', desc: 'Transaksi pertama', icon: '🎯' },
+  { id: 'streak_3', name: '3 Day Streak', desc: '3 hari berturut-turut', icon: '🔥' },
+  { id: 'streak_7', name: 'Week Warrior', desc: '7 hari berturut-turut', icon: '⚡' },
+  { id: 'under_budget', name: 'Budget Master', desc: 'Selesai periode under budget', icon: '🏆' },
+  { id: 'challenge_complete', name: 'Challenge Accepted', desc: 'Selesaikan daily challenge', icon: '✅' }
+]
+
+// Get random daily challenge
+function getDailyChallenge() {
+  const today = new Date().toISOString().split('T')[0]
+  const seed = parseInt(today.replace(/-/g, ''))
+  const index = seed % DAILY_CHALLENGES.length
+  return DAILY_CHALLENGES[index]
+}
+
+// Get random finance tip
+function getRandomTip() {
+  return FINANCE_TIPS[Math.floor(Math.random() * FINANCE_TIPS.length)]
+}
+
+// Calculate budget health score (A-F)
+function getBudgetHealthScore(spent, budget, daysLeft, totalDays) {
+  const pctUsed = (spent / budget) * 100
+  const pctTimeLeft = (daysLeft / totalDays) * 100
+  
+  // If spent less percentage than time passed = good
+  const ratio = pctUsed / (100 - pctTimeLeft + 1)
+  
+  if (ratio < 0.5) return { grade: 'A', emoji: '🌟', status: 'EXCELLENT' }
+  if (ratio < 0.8) return { grade: 'B', emoji: '😊', status: 'BAGUS' }
+  if (ratio < 1.0) return { grade: 'C', emoji: '😐', status: 'CUKUP' }
+  if (ratio < 1.3) return { grade: 'D', emoji: '😰', status: 'HATI-HATI' }
+  return { grade: 'F', emoji: '🚨', status: 'BAHAYA' }
+}
+
+// Get spending mood emoji
+function getSpendingMood(todaySpent, avgDaily) {
+  const ratio = todaySpent / (avgDaily || 1)
+  if (ratio < 0.5) return { emoji: '😇', text: 'Super hemat!' }
+  if (ratio < 0.8) return { emoji: '😊', text: 'Bagus!' }
+  if (ratio < 1.2) return { emoji: '😐', text: 'Normal' }
+  if (ratio < 2.0) return { emoji: '😬', text: 'Agak boros' }
+  return { emoji: '😱', text: 'Boros banget!' }
+}
+
+// Get saving tip based on top category
+function getSavingTip(topCategory) {
+  const tips = {
+    'Makanan & Minuman': '🍽️ Tips: Masak sendiri 2x seminggu bisa hemat 500rb/bulan!',
+    'Transport': '🚗 Tips: Gabung carpool atau coba naik transportasi umum!',
+    'Lifestyle': '🎮 Tips: Set budget entertainment max 10% dari gaji!',
+    'Belanja Kebutuhan': '🛒 Tips: Buat list belanja, jangan impulsif beli!',
+    'Kesehatan': '💊 Tips: Jaga kesehatan = hemat biaya dokter!',
+    'Tagihan & Utang': '📱 Tips: Review paket internet/HP, downgrade jika perlu!'
+  }
+  return tips[topCategory] || '💡 Tips: Review pengeluaran dan cut yang tidak perlu!'
+}
 
 // =====================================
 // HELPER FUNCTIONS
@@ -383,26 +488,33 @@ function getLevel(xp) {
 const HELP_MESSAGE = `
 📱 *Budget Tracker Bot*
 
-*Commands:*
-• \`!login <email>\` - Login
-• \`!logout\` - Logout
-• \`!kategori\` - Lihat daftar kategori
+*📊 Query & Reports:*
 • \`!hari\` - Transaksi hari ini
-• \`!minggu\` - Ringkasan minggu ini 📊
-• \`!bandingan\` - Bandingkan vs bulan lalu 📊
-• \`!prediksi\` - Prediksi budget habis 🔮
-• \`!recap\` - Rangkuman lengkap 📋
-• \`!chart\` - Grafik pengeluaran 📊
+• \`!minggu\` - Ringkasan minggu ini
+• \`!bandingan\` - vs bulan lalu
+• \`!prediksi\` - Prediksi budget
+• \`!recap\` - Rangkuman lengkap
+• \`!chart\` - Grafik 📊
 • \`!export\` - Export Excel 📂
-• \`!stats\` - Statistik XP & Level 🎮
-• \`!undo\` - Batalkan transaksi terakhir ↩️
-• \`!hapus <nomor>\` - Hapus transaksi hari ini
-• \`!ingatkan <tagihan> <tgl>\` - Reminder 🔔
-• \`!reminder\` - Lihat daftar reminder
-• \`!alert on/off\` - Notifikasi budget
-• \`!help\` - Bantuan
 
-*Catat Transaksi:*
+*🎮 Gamifikasi:*
+• \`!challenge\` - Tantangan harian 🎯
+• \`!health\` - Budget health score 🏥
+• \`!mood\` - Spending mood 😊
+• \`!stats\` - XP & Level
+• \`!tips\` - Tips keuangan 💡
+
+*🔧 Manajemen:*
+• \`!login\` / \`!logout\`
+• \`!kategori\` - Daftar kategori
+• \`!undo\` - Batalkan terakhir
+• \`!hapus <n>\` - Hapus transaksi
+• \`!ingatkan <tagihan> <tgl>\` 🔔
+• \`!reminder\` - Lihat reminder
+• \`!alert on/off\` - Notifikasi
+
+*📝 Catat:* "Makan 25k" atau "Makan 25k, bensin 50k"
+`.trim()
 • "Makan 25k" (auto kategori)
 • "Kado 50k #7" (manual: #7 = Lainnya)
 • "Makan 25k, bensin 50k" (multi!)
@@ -1127,6 +1239,109 @@ client.on('message', async (message) => {
         `Transaksi: ${txs?.length || 0}`
       )
     }
+    // === DAILY CHALLENGE ===
+    else if (command.type === 'DAILY_CHALLENGE') {
+      const challenge = getDailyChallenge()
+      
+      await message.reply(
+        `🎯 *Daily Challenge*\n\n` +
+        `📅 Tantangan Hari Ini:\n` +
+        `"${challenge.text}"\n\n` +
+        `${challenge.maxSpend ? `💰 Max: ${formatCurrency(challenge.maxSpend)}` : ''}\n` +
+        `${challenge.maxTx ? `📝 Max transaksi: ${challenge.maxTx}` : ''}\n\n` +
+        `_Selesaikan untuk dapat achievement!_`
+      )
+    }
+    // === BUDGET HEALTH SCORE ===
+    else if (command.type === 'BUDGET_HEALTH') {
+      const { data: period } = await supabase
+        .from('budget_periods')
+        .select('budget_bulanan, tanggal_mulai, tanggal_selesai')
+        .eq('user_id', session.userId)
+        .eq('is_active', true)
+        .single()
+      
+      if (!period) {
+        await message.reply('❌ Tidak ada periode budget aktif.')
+        return
+      }
+      
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('harga, kategori')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+        .gte('tanggal_transaksi', period.tanggal_mulai)
+        .lte('tanggal_transaksi', period.tanggal_selesai)
+      
+      const spent = txs?.reduce((s, t) => s + Number(t.harga), 0) || 0
+      const budget = Number(period.budget_bulanan)
+      
+      const start = new Date(period.tanggal_mulai)
+      const end = new Date(period.tanggal_selesai)
+      const today = new Date()
+      const totalDays = Math.floor((end - start) / (1000 * 60 * 60 * 24))
+      const daysLeft = Math.max(0, Math.floor((end - today) / (1000 * 60 * 60 * 24)))
+      
+      const health = getBudgetHealthScore(spent, budget, daysLeft, totalDays)
+      
+      // Find top category for tip
+      const byCategory = {}
+      txs?.forEach(t => {
+        byCategory[t.kategori] = (byCategory[t.kategori] || 0) + Number(t.harga)
+      })
+      const topCat = Object.entries(byCategory).sort((a, b) => b[1] - a[1])[0]?.[0]
+      const tip = getSavingTip(topCat)
+      
+      await message.reply(
+        `🏥 *Budget Health Score*\n\n` +
+        `${health.emoji} Grade: *${health.grade}*\n` +
+        `📊 Status: ${health.status}\n\n` +
+        `💰 Budget: ${formatCurrency(budget)}\n` +
+        `💸 Terpakai: ${formatCurrency(spent)} (${Math.round((spent/budget)*100)}%)\n` +
+        `📅 Sisa waktu: ${daysLeft} hari\n\n` +
+        `${tip}`
+      )
+    }
+    // === SPENDING MOOD ===
+    else if (command.type === 'SPENDING_MOOD') {
+      const today = new Date().toISOString().split('T')[0]
+      
+      // Get today's spending
+      const { data: todayTxs } = await supabase
+        .from('transactions')
+        .select('harga')
+        .eq('user_id', session.userId)
+        .eq('tanggal_transaksi', today)
+        .eq('type', 'expense')
+      
+      // Get average daily spending (last 30 days)
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+      const { data: recentTxs } = await supabase
+        .from('transactions')
+        .select('harga')
+        .eq('user_id', session.userId)
+        .gte('tanggal_transaksi', thirtyDaysAgo)
+        .eq('type', 'expense')
+      
+      const todaySpent = todayTxs?.reduce((s, t) => s + Number(t.harga), 0) || 0
+      const totalRecent = recentTxs?.reduce((s, t) => s + Number(t.harga), 0) || 0
+      const avgDaily = totalRecent / 30
+      
+      const mood = getSpendingMood(todaySpent, avgDaily)
+      
+      await message.reply(
+        `${mood.emoji} *Spending Mood: ${mood.text}*\n\n` +
+        `💸 Hari ini: ${formatCurrency(todaySpent)}\n` +
+        `📊 Rata-rata harian: ${formatCurrency(Math.round(avgDaily))}\n\n` +
+        `_${todaySpent < avgDaily ? 'Good job! Kamu hemat hari ini! 🎉' : 'Coba kurangi pengeluaran ya!'}_`
+      )
+    }
+    // === RANDOM TIP ===
+    else if (command.type === 'RANDOM_TIP') {
+      const tip = getRandomTip()
+      await message.reply(tip)
+    }
     else if (command.type === 'HELP') {
       await message.reply(HELP_MESSAGE)
     }
@@ -1426,12 +1641,89 @@ cron.schedule('0 21 * * *', async () => {
 })
 
 // =====================================
+// GOOD MORNING MESSAGE (CRON JOB)
+// =====================================
+// Run every day at 7:00 AM
+cron.schedule('0 7 * * *', async () => {
+  console.log(`☀️ Sending good morning messages...`)
+  
+  for (const [phone, session] of activeSessions) {
+    if (!session.alertEnabled) continue
+    
+    try {
+      // Get budget info
+      const { data: period } = await supabase
+        .from('budget_periods')
+        .select('budget_bulanan, tanggal_mulai, tanggal_selesai')
+        .eq('user_id', session.userId)
+        .eq('is_active', true)
+        .single()
+      
+      if (!period) continue
+      
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('harga')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+        .gte('tanggal_transaksi', period.tanggal_mulai)
+        .lte('tanggal_transaksi', period.tanggal_selesai)
+      
+      const spent = txs?.reduce((s, t) => s + Number(t.harga), 0) || 0
+      const remaining = Number(period.budget_bulanan) - spent
+      
+      const challenge = getDailyChallenge()
+      
+      await client.sendMessage(`${phone}@c.us`, 
+        `☀️ *Selamat Pagi!*\n\n` +
+        `💰 Sisa budget: *${formatCurrency(remaining)}*\n\n` +
+        `🎯 *Tantangan Hari Ini:*\n"${challenge.text}"\n\n` +
+        `_Semangat jalani hari ini!_ 💪`
+      )
+      console.log(`☀️ Sent morning message to ${phone}`)
+    } catch (error) {
+      console.error(`Morning message error for ${phone}:`, error)
+    }
+  }
+})
+
+// =====================================
+// EVENING TIPS (CRON JOB)
+// =====================================
+// Run every day at 6:00 PM
+cron.schedule('0 18 * * *', async () => {
+  console.log(`🌅 Sending evening tips...`)
+  
+  for (const [phone, session] of activeSessions) {
+    if (!session.alertEnabled) continue
+    
+    try {
+      const tip = getRandomTip()
+      
+      await client.sendMessage(`${phone}@c.us`, 
+        `🌅 *Tips Sore*\n\n` +
+        `${tip}\n\n` +
+        `_Sudah catat pengeluaran hari ini?_`
+      )
+      console.log(`🌅 Sent evening tip to ${phone}`)
+    } catch (error) {
+      console.error(`Evening tip error for ${phone}:`, error)
+    }
+  }
+})
+
+// =====================================
 // START BOT
 // =====================================
 console.log('\n🚀 Starting WhatsApp Budget Bot...')
 console.log('📁 Auth data:', './.wwebjs_auth')
 console.log('📊 Features: Chart, Export, Gamification, Smart Alerts, Reminders')
-console.log('⏰ Cron Jobs: Budget Alert (08:00), Reminders (08:00), Daily Summary (21:00)')
+console.log('🎮 Gamification: Challenges, Health Score, Mood, Tips')
+console.log('⏰ Cron Jobs:')
+console.log('   - 07:00: Good Morning + Challenge')
+console.log('   - 08:00: Budget Alert + Bill Reminders')
+console.log('   - 18:00: Evening Tips')
+console.log('   - 21:00: Daily Summary')
 console.log('')
 
 client.initialize()
