@@ -155,6 +155,21 @@ function parseCommand(text) {
     return { type: 'DELETE_REMINDER', index: num }
   }
   
+  // Monthly comparison
+  if (lower === '!bandingan' || lower === '!compare') {
+    return { type: 'MONTHLY_COMPARISON' }
+  }
+  
+  // Spending prediction
+  if (lower === '!prediksi' || lower === '!predict') {
+    return { type: 'SPENDING_PREDICTION' }
+  }
+  
+  // Full recap
+  if (lower === '!recap' || lower === '!rangkuman') {
+    return { type: 'FULL_RECAP' }
+  }
+  
   // Multi-transaction: Check if contains comma (e.g., "makan 25k, bensin 50k")
   if (text.includes(',')) {
     const parts = text.split(',').map(p => p.trim()).filter(p => p)
@@ -374,12 +389,15 @@ const HELP_MESSAGE = `
 • \`!kategori\` - Lihat daftar kategori
 • \`!hari\` - Transaksi hari ini
 • \`!minggu\` - Ringkasan minggu ini 📊
+• \`!bandingan\` - Bandingkan vs bulan lalu 📊
+• \`!prediksi\` - Prediksi budget habis 🔮
+• \`!recap\` - Rangkuman lengkap 📋
 • \`!chart\` - Grafik pengeluaran 📊
 • \`!export\` - Export Excel 📂
 • \`!stats\` - Statistik XP & Level 🎮
 • \`!undo\` - Batalkan transaksi terakhir ↩️
 • \`!hapus <nomor>\` - Hapus transaksi hari ini
-• \`!ingatkan <tagihan> <tgl>\` - Reminder tagihan 🔔
+• \`!ingatkan <tagihan> <tgl>\` - Reminder 🔔
 • \`!reminder\` - Lihat daftar reminder
 • \`!alert on/off\` - Notifikasi budget
 • \`!help\` - Bantuan
@@ -388,8 +406,6 @@ const HELP_MESSAGE = `
 • "Makan 25k" (auto kategori)
 • "Kado 50k #7" (manual: #7 = Lainnya)
 • "Makan 25k, bensin 50k" (multi!)
-• 🎤 Voice note _(coming soon)_
-• 📷 Foto struk _(coming soon)_
 
 *Query:*
 • "Sisa budget?"
@@ -961,6 +977,155 @@ client.on('message', async (message) => {
       userReminders.set(phone, reminders)
       
       await message.reply(`🗑️ Reminder "${deleted.name}" dihapus.`)
+    }
+    // === MONTHLY COMPARISON ===
+    else if (command.type === 'MONTHLY_COMPARISON') {
+      const now = new Date()
+      const thisMonth = now.toISOString().slice(0, 7) // YYYY-MM
+      const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1)
+      const lastMonth = lastMonthDate.toISOString().slice(0, 7)
+      
+      // This month transactions
+      const { data: thisMonthTxs } = await supabase
+        .from('transactions')
+        .select('harga, kategori')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+        .gte('tanggal_transaksi', `${thisMonth}-01`)
+        .lte('tanggal_transaksi', `${thisMonth}-31`)
+      
+      // Last month transactions
+      const { data: lastMonthTxs } = await supabase
+        .from('transactions')
+        .select('harga, kategori')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+        .gte('tanggal_transaksi', `${lastMonth}-01`)
+        .lte('tanggal_transaksi', `${lastMonth}-31`)
+      
+      const thisTotal = thisMonthTxs?.reduce((s, t) => s + Number(t.harga), 0) || 0
+      const lastTotal = lastMonthTxs?.reduce((s, t) => s + Number(t.harga), 0) || 0
+      
+      const diff = thisTotal - lastTotal
+      const pctChange = lastTotal > 0 ? Math.round((diff / lastTotal) * 100) : 0
+      const emoji = diff > 0 ? '📈' : (diff < 0 ? '📉' : '➡️')
+      const status = diff > 0 ? 'NAIK' : (diff < 0 ? 'TURUN' : 'SAMA')
+      
+      await message.reply(
+        `📊 *Perbandingan Bulanan*\n\n` +
+        `📅 Bulan lalu (${lastMonth}): ${formatCurrency(lastTotal)}\n` +
+        `📅 Bulan ini (${thisMonth}): ${formatCurrency(thisTotal)}\n\n` +
+        `${emoji} *${status} ${Math.abs(pctChange)}%*\n` +
+        `Selisih: ${diff >= 0 ? '+' : ''}${formatCurrency(diff)}`
+      )
+    }
+    // === SPENDING PREDICTION ===
+    else if (command.type === 'SPENDING_PREDICTION') {
+      // Get active period
+      const { data: period } = await supabase
+        .from('budget_periods')
+        .select('budget_bulanan, tanggal_mulai, tanggal_selesai')
+        .eq('user_id', session.userId)
+        .eq('is_active', true)
+        .single()
+      
+      if (!period) {
+        await message.reply('❌ Tidak ada periode budget aktif.')
+        return
+      }
+      
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('harga, tanggal_transaksi')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+        .gte('tanggal_transaksi', period.tanggal_mulai)
+        .lte('tanggal_transaksi', period.tanggal_selesai)
+      
+      const totalSpent = txs?.reduce((s, t) => s + Number(t.harga), 0) || 0
+      const budget = Number(period.budget_bulanan)
+      const remaining = budget - totalSpent
+      
+      const start = new Date(period.tanggal_mulai)
+      const end = new Date(period.tanggal_selesai)
+      const today = new Date()
+      
+      const daysPassed = Math.max(1, Math.floor((today - start) / (1000 * 60 * 60 * 24)))
+      const totalDays = Math.floor((end - start) / (1000 * 60 * 60 * 24))
+      const daysLeft = Math.max(0, totalDays - daysPassed)
+      
+      const dailyRate = totalSpent / daysPassed
+      const projectedTotal = dailyRate * totalDays
+      const daysUntilEmpty = dailyRate > 0 ? Math.floor(remaining / dailyRate) : 999
+      
+      const status = projectedTotal > budget ? '⚠️ OVER BUDGET' : '✅ AMAN'
+      
+      await message.reply(
+        `🔮 *Prediksi Pengeluaran*\n\n` +
+        `📊 Rate harian: ${formatCurrency(Math.round(dailyRate))}/hari\n` +
+        `📅 Sisa hari: ${daysLeft} hari\n\n` +
+        `💰 Budget: ${formatCurrency(budget)}\n` +
+        `💸 Terpakai: ${formatCurrency(totalSpent)}\n` +
+        `📈 Proyeksi: ${formatCurrency(Math.round(projectedTotal))}\n\n` +
+        `${status}\n` +
+        `⏰ Budget habis dalam: *${daysUntilEmpty} hari*`
+      )
+    }
+    // === FULL RECAP ===
+    else if (command.type === 'FULL_RECAP') {
+      // Get active period
+      const { data: period } = await supabase
+        .from('budget_periods')
+        .select('budget_bulanan, tanggal_mulai, tanggal_selesai')
+        .eq('user_id', session.userId)
+        .eq('is_active', true)
+        .single()
+      
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('harga, kategori')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+        .gte('tanggal_transaksi', period?.tanggal_mulai || '2020-01-01')
+        .lte('tanggal_transaksi', period?.tanggal_selesai || '2099-12-31')
+      
+      const totalSpent = txs?.reduce((s, t) => s + Number(t.harga), 0) || 0
+      const budget = Number(period?.budget_bulanan) || 0
+      const remaining = budget - totalSpent
+      const pct = budget > 0 ? Math.round((totalSpent / budget) * 100) : 0
+      
+      // By category
+      const byCategory = {}
+      txs?.forEach(t => {
+        byCategory[t.kategori] = (byCategory[t.kategori] || 0) + Number(t.harga)
+      })
+      
+      let catList = ''
+      Object.entries(byCategory)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .forEach(([cat, amt]) => {
+          const catPct = Math.round((amt / totalSpent) * 100)
+          catList += `• ${cat}: ${formatCurrency(amt)} (${catPct}%)\n`
+        })
+      
+      // XP
+      const totalXP = txs?.reduce((sum, t) => sum + calculateXP(Number(t.harga)), 0) || 0
+      const levelInfo = getLevel(totalXP)
+      
+      await message.reply(
+        `📋 *RECAP LENGKAP*\n` +
+        `━━━━━━━━━━━━━━━━━\n\n` +
+        `💰 *Budget*\n` +
+        `Budget: ${formatCurrency(budget)}\n` +
+        `Terpakai: ${formatCurrency(totalSpent)} (${pct}%)\n` +
+        `Sisa: ${formatCurrency(remaining)}\n\n` +
+        `🏷️ *Top Kategori*\n${catList}\n` +
+        `🎮 *Gamifikasi*\n` +
+        `Level ${levelInfo.level}: ${levelInfo.name}\n` +
+        `XP: ${totalXP}\n` +
+        `Transaksi: ${txs?.length || 0}`
+      )
     }
     else if (command.type === 'HELP') {
       await message.reply(HELP_MESSAGE)
