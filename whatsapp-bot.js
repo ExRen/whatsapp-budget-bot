@@ -190,7 +190,16 @@ const client = new Client({
   }),
   puppeteer: { 
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: [
+      '--no-sandbox', 
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',  // ADD THIS
+      '--disable-accelerated-2d-canvas',  // ADD THIS
+      '--no-first-run',  // ADD THIS
+      '--no-zygote',  // ADD THIS
+      '--single-process',  // ADD THIS (use with caution)
+      '--disable-gpu'  // ADD THIS
+    ]
   }
 })
 
