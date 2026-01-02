@@ -515,14 +515,6 @@ const HELP_MESSAGE = `
 
 *📝 Catat:* "Makan 25k" atau "Makan 25k, bensin 50k"
 `.trim()
-• "Makan 25k" (auto kategori)
-• "Kado 50k #7" (manual: #7 = Lainnya)
-• "Makan 25k, bensin 50k" (multi!)
-
-*Query:*
-• "Sisa budget?"
-• "Total pengeluaran"
-`.trim()
 
 // =====================================
 // WHATSAPP CLIENT
