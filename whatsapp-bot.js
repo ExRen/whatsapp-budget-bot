@@ -118,7 +118,67 @@ function parseCommand(text) {
     return { type: 'HELP' }
   }
   
-  // Transaction command
+  // Undo command
+  if (lower === '!undo') {
+    return { type: 'UNDO' }
+  }
+  
+  // Delete transaction command
+  if (lower.startsWith('!hapus ')) {
+    const num = parseInt(lower.slice(7).trim())
+    return { type: 'DELETE_TODAY', index: num }
+  }
+  
+  // Weekly summary
+  if (lower === '!minggu' || lower === '!week') {
+    return { type: 'QUERY_WEEKLY' }
+  }
+  
+  // Multi-transaction: Check if contains comma (e.g., "makan 25k, bensin 50k")
+  if (text.includes(',')) {
+    const parts = text.split(',').map(p => p.trim()).filter(p => p)
+    const transactions = []
+    
+    for (const part of parts) {
+      const amount = parseAmount(part)
+      if (amount) {
+        let kategori = null
+        const categoryMatch = part.match(/#(\d+)/)
+        if (categoryMatch) {
+          const index = parseInt(categoryMatch[1]) - 1
+          if (index >= 0 && index < CATEGORY_LIST.length) {
+            kategori = CATEGORY_LIST[index]
+          }
+        }
+        
+        let nama = part.replace(/#\d+/g, '').trim()
+        nama = nama.replace(/(\d+[.,]?\d*)\s*(k|rb|ribu|jt|juta)?/gi, '').trim()
+        nama = nama.replace(/\b(catat|tambah|beli|bayar|untuk|buat|seharga|rp|idr)\b/gi, '').trim()
+        nama = nama.replace(/#/g, '').trim()
+        nama = nama.replace(/\s+/g, ' ').trim()
+        
+        if (nama) {
+          nama = nama.charAt(0).toUpperCase() + nama.slice(1)
+        } else {
+          nama = 'Transaksi'
+        }
+        
+        transactions.push({
+          nama_belanja: nama,
+          harga: amount,
+          kategori: kategori || detectCategory(part),
+          tanggal_transaksi: new Date().toISOString().split('T')[0],
+          type: 'expense'
+        })
+      }
+    }
+    
+    if (transactions.length > 1) {
+      return { type: 'ADD_MULTI_TRANSACTION', data: transactions }
+    }
+  }
+  
+  // Single Transaction command
   const amount = parseAmount(text)
   if (amount) {
     // IMPORTANT: Extract category index from ORIGINAL text FIRST
@@ -291,15 +351,19 @@ const HELP_MESSAGE = `
 • \`!logout\` - Logout
 • \`!kategori\` - Lihat daftar kategori
 • \`!hari\` - Transaksi hari ini
+• \`!minggu\` - Ringkasan minggu ini 📊
 • \`!chart\` - Grafik pengeluaran 📊
 • \`!export\` - Export Excel 📂
 • \`!stats\` - Statistik XP & Level 🎮
+• \`!undo\` - Batalkan transaksi terakhir ↩️
+• \`!hapus <nomor>\` - Hapus transaksi hari ini
 • \`!alert on/off\` - Notifikasi budget
 • \`!help\` - Bantuan
 
 *Catat Transaksi:*
 • "Makan 25k" (auto kategori)
 • "Kado 50k #7" (manual: #7 = Lainnya)
+• "Makan 25k, bensin 50k" (multi!)
 
 *Query:*
 • "Sisa budget?"
@@ -478,14 +542,14 @@ client.on('message', async (message) => {
     if (command.type === 'ADD_TRANSACTION') {
       const { nama_belanja, harga, kategori, tanggal_transaksi, type } = command.data
       
-      const { error } = await supabase.from('transactions').insert({
+      const { data: insertedTx, error } = await supabase.from('transactions').insert({
         user_id: session.userId,
         nama_belanja,
         harga,
         kategori,
         tanggal_transaksi,
         type
-      })
+      }).select().single()
       
       if (error) {
         console.error('Insert error:', error)
@@ -493,14 +557,22 @@ client.on('message', async (message) => {
         return
       }
       
-      console.log(`💰 Transaksi: ${nama_belanja} ${formatCurrency(harga)} (${session.email || session.fullName})`)
+      // Store last transaction for undo
+      session.lastTransaction = insertedTx
+      activeSessions.set(phone, session)
+      
+      // Calculate XP gained
+      const xpGained = calculateXP(harga)
+      
+      console.log(`💰 Transaksi: ${nama_belanja} ${formatCurrency(harga)} (+${xpGained} XP)`)
       
       await message.reply(
         `✅ *Tercatat!*\n\n` +
         `📝 ${nama_belanja}\n` +
         `💰 ${formatCurrency(harga)}\n` +
         `🏷️ ${kategori}\n` +
-        `📅 ${tanggal_transaksi}`
+        `📅 ${tanggal_transaksi}\n\n` +
+        `✨ *+${xpGained} XP*`
       )
     }
     else if (command.type === 'QUERY_REMAINING') {
@@ -626,6 +698,164 @@ client.on('message', async (message) => {
       list += `\n━━━━━━━━━━━━━\n*Total: ${formatCurrency(total)}*`
       
       await message.reply(list)
+    }
+    // === UNDO LAST TRANSACTION ===
+    else if (command.type === 'UNDO') {
+      if (!session.lastTransaction) {
+        await message.reply('❌ Tidak ada transaksi untuk di-undo.')
+        return
+      }
+      
+      const { error } = await supabase
+        .from('transactions')
+        .delete()
+        .eq('id', session.lastTransaction.id)
+      
+      if (error) {
+        await message.reply('❌ Gagal undo transaksi.')
+        return
+      }
+      
+      const undone = session.lastTransaction
+      session.lastTransaction = null
+      activeSessions.set(phone, session)
+      
+      await message.reply(
+        `↩️ *Transaksi Di-undo!*\n\n` +
+        `📝 ${undone.nama_belanja}\n` +
+        `💰 ${formatCurrency(undone.harga)}\n\n` +
+        `_Transaksi telah dihapus._`
+      )
+    }
+    // === DELETE TODAY'S TRANSACTION BY INDEX ===
+    else if (command.type === 'DELETE_TODAY') {
+      const today = new Date().toISOString().split('T')[0]
+      
+      // Get today's transactions
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('id, nama_belanja, harga')
+        .eq('user_id', session.userId)
+        .eq('tanggal_transaksi', today)
+        .order('created_at', { ascending: false })
+      
+      if (!txs || txs.length === 0) {
+        await message.reply('❌ Tidak ada transaksi hari ini.')
+        return
+      }
+      
+      const index = command.index - 1 // 1-indexed to 0-indexed
+      if (index < 0 || index >= txs.length) {
+        await message.reply(`❌ Nomor tidak valid. Gunakan 1-${txs.length}.\n\nKetik \`!hari\` untuk lihat daftar.`)
+        return
+      }
+      
+      const toDelete = txs[index]
+      
+      const { error } = await supabase
+        .from('transactions')
+        .delete()
+        .eq('id', toDelete.id)
+      
+      if (error) {
+        await message.reply('❌ Gagal menghapus transaksi.')
+        return
+      }
+      
+      await message.reply(
+        `🗑️ *Transaksi Dihapus!*\n\n` +
+        `📝 ${toDelete.nama_belanja}\n` +
+        `💰 ${formatCurrency(toDelete.harga)}`
+      )
+    }
+    // === WEEKLY SUMMARY ===
+    else if (command.type === 'QUERY_WEEKLY') {
+      const today = new Date()
+      const weekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000)
+      const startDate = weekAgo.toISOString().split('T')[0]
+      const endDate = today.toISOString().split('T')[0]
+      
+      const { data: txs } = await supabase
+        .from('transactions')
+        .select('harga, kategori, tanggal_transaksi')
+        .eq('user_id', session.userId)
+        .eq('type', 'expense')
+        .gte('tanggal_transaksi', startDate)
+        .lte('tanggal_transaksi', endDate)
+      
+      if (!txs || txs.length === 0) {
+        await message.reply('📊 *Ringkasan Minggu Ini*\n\n_Belum ada transaksi._')
+        return
+      }
+      
+      const total = txs.reduce((sum, t) => sum + Number(t.harga), 0)
+      const avgPerDay = Math.round(total / 7)
+      
+      // Group by category
+      const byCategory = {}
+      txs.forEach(t => {
+        byCategory[t.kategori] = (byCategory[t.kategori] || 0) + Number(t.harga)
+      })
+      
+      // Group by day
+      const byDay = {}
+      txs.forEach(t => {
+        byDay[t.tanggal_transaksi] = (byDay[t.tanggal_transaksi] || 0) + Number(t.harga)
+      })
+      
+      let categoryBreakdown = ''
+      Object.entries(byCategory)
+        .sort((a, b) => b[1] - a[1])
+        .forEach(([cat, amt]) => {
+          const pct = Math.round((amt / total) * 100)
+          categoryBreakdown += `• ${cat}: ${formatCurrency(amt)} (${pct}%)\n`
+        })
+      
+      await message.reply(
+        `📊 *Ringkasan Minggu Ini*\n` +
+        `📅 ${startDate} - ${endDate}\n\n` +
+        `💰 *Total: ${formatCurrency(total)}*\n` +
+        `📝 Transaksi: ${txs.length}\n` +
+        `📈 Rata-rata/hari: ${formatCurrency(avgPerDay)}\n\n` +
+        `*Per Kategori:*\n${categoryBreakdown}`
+      )
+    }
+    // === MULTI-TRANSACTION ===
+    else if (command.type === 'ADD_MULTI_TRANSACTION') {
+      const transactions = command.data
+      let insertedCount = 0
+      let totalAmount = 0
+      let totalXP = 0
+      let details = ''
+      
+      for (const tx of transactions) {
+        const { error } = await supabase.from('transactions').insert({
+          user_id: session.userId,
+          ...tx
+        })
+        
+        if (!error) {
+          insertedCount++
+          totalAmount += tx.harga
+          totalXP += calculateXP(tx.harga)
+          details += `• ${tx.nama_belanja}: ${formatCurrency(tx.harga)} (${tx.kategori})\n`
+        }
+      }
+      
+      if (insertedCount === 0) {
+        await message.reply('❌ Gagal menyimpan transaksi.')
+        return
+      }
+      
+      console.log(`💰 Multi-transaksi: ${insertedCount} items, ${formatCurrency(totalAmount)} (+${totalXP} XP)`)
+      
+      await message.reply(
+        `✅ *${insertedCount} Transaksi Tercatat!*\n\n` +
+        details +
+        `\n━━━━━━━━━━━━━\n` +
+        `💰 Total: *${formatCurrency(totalAmount)}*\n` +
+        `✨ *+${totalXP} XP*`
+      )
     }
     else if (command.type === 'HELP') {
       await message.reply(HELP_MESSAGE)
