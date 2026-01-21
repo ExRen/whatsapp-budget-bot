@@ -40,6 +40,145 @@ if (!supabaseUrl || !supabaseKey) {
 const supabase = createClient(supabaseUrl, supabaseKey)
 
 // =====================================
+// CLIENT STATE & ERROR HANDLING
+// =====================================
+let clientReady = false
+let reconnectAttempts = 0
+const MAX_RECONNECT_ATTEMPTS = 5
+const RECONNECT_DELAY = 5000 // 5 seconds
+
+// Health Check Configuration
+const HEALTH_CHECK_INTERVAL = 30000 // 30 seconds
+const HEALTH_CHECK_RETRIES = 5
+let healthCheckIntervalId = null
+
+// Safe message sender with retry logic
+async function safeReply(message, text, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      if (!clientReady) {
+        console.log('⏳ Client not ready, waiting...')
+        await new Promise(resolve => setTimeout(resolve, 2000))
+        if (!clientReady) {
+          throw new Error('Client not ready after waiting')
+        }
+      }
+      
+      await message.reply(text)
+      return true
+    } catch (error) {
+      const isContextDestroyed = error.message?.includes('Execution context was destroyed') ||
+                                  error.message?.includes('Protocol error') ||
+                                  error.message?.includes('Target closed') ||
+                                  error.message?.includes('Session closed') ||
+                                  error.message?.includes('detached Frame')
+      
+      console.error(`❌ Send attempt ${attempt}/${retries} failed:`, error.message)
+      
+      if (isContextDestroyed) {
+        console.log('🔄 Context destroyed, marking client as not ready...')
+        clientReady = false
+      }
+      
+      if (attempt < retries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 10000) // Exponential backoff, max 10s
+        console.log(`⏳ Retrying in ${delay}ms...`)
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
+  
+  console.error('❌ All send attempts failed')
+  return false
+}
+
+// Safe client send (for proactive messages)
+async function safeSendMessage(chatId, text, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      if (!clientReady) {
+        console.log('⏳ Client not ready, waiting...')
+        await new Promise(resolve => setTimeout(resolve, 2000))
+        if (!clientReady) {
+          throw new Error('Client not ready after waiting')
+        }
+      }
+      
+      await client.sendMessage(chatId, text)
+      return true
+    } catch (error) {
+      const isContextDestroyed = error.message?.includes('Execution context was destroyed') ||
+                                  error.message?.includes('Protocol error') ||
+                                  error.message?.includes('Target closed') ||
+                                  error.message?.includes('Session closed') ||
+                                  error.message?.includes('detached Frame')
+      
+      console.error(`❌ SendMessage attempt ${attempt}/${retries} failed:`, error.message)
+      
+      if (isContextDestroyed) {
+        console.log('🔄 Context destroyed, marking client as not ready...')
+        clientReady = false
+      }
+      
+      if (attempt < retries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 10000)
+        console.log(`⏳ Retrying in ${delay}ms...`)
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
+  
+  console.error('❌ All sendMessage attempts failed')
+  return false
+}
+
+// Check if client is operational
+function isClientReady() {
+  return clientReady
+}
+
+// =====================================
+// HEALTH CHECK SYSTEM
+// =====================================
+async function performHealthCheck() {
+  for (let attempt = 1; attempt <= HEALTH_CHECK_RETRIES; attempt++) {
+    try {
+      const state = await client.getState()
+      if (state === 'CONNECTED') {
+        clientReady = true
+        console.log('✅ Health check: Client is healthy')
+        return true
+      }
+    } catch (error) {
+      console.warn(`⚠️ Health check failed (${attempt}/${HEALTH_CHECK_RETRIES}): ${error.message}`)
+      clientReady = false
+      
+      if (attempt < HEALTH_CHECK_RETRIES) {
+        await new Promise(r => setTimeout(r, 2000))
+      }
+    }
+  }
+  
+  console.error('❌ Health check: All retries failed, client may be unresponsive')
+  clientReady = false
+  return false
+}
+
+function startHealthCheck() {
+  if (healthCheckIntervalId) clearInterval(healthCheckIntervalId)
+  healthCheckIntervalId = setInterval(performHealthCheck, HEALTH_CHECK_INTERVAL)
+  console.log('🏥 Health check started (every 30s)')
+}
+
+function stopHealthCheck() {
+  if (healthCheckIntervalId) {
+    clearInterval(healthCheckIntervalId)
+    healthCheckIntervalId = null
+    console.log('🛑 Health check stopped')
+  }
+}
+
+// =====================================
 // AI COMMAND PARSER (Same as web app)
 // =====================================
 const CATEGORY_KEYWORDS = {
@@ -559,9 +698,14 @@ client.on('qr', (qr) => {
 })
 
 client.on('ready', () => {
+  clientReady = true
+  reconnectAttempts = 0
   console.log('✅ WhatsApp Bot siap digunakan!')
   console.log('📞 Nomor terhubung:', client.info.wid.user)
   console.log('\nMenunggu pesan...\n')
+  
+  // Start health check interval
+  startHealthCheck()
 })
 
 client.on('authenticated', () => {
@@ -569,11 +713,32 @@ client.on('authenticated', () => {
 })
 
 client.on('auth_failure', (msg) => {
+  clientReady = false
   console.error('❌ Autentikasi gagal:', msg)
 })
 
-client.on('disconnected', (reason) => {
+client.on('disconnected', async (reason) => {
+  clientReady = false
+  stopHealthCheck() // Stop health check on disconnect
   console.log('🔌 Terputus:', reason)
+  
+  // Auto-reconnect logic
+  if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    reconnectAttempts++
+    const delay = RECONNECT_DELAY * reconnectAttempts
+    console.log(`🔄 Auto-reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay/1000}s...`)
+    
+    await new Promise(resolve => setTimeout(resolve, delay))
+    
+    try {
+      console.log('🔄 Reinitializing client...')
+      await client.initialize()
+    } catch (error) {
+      console.error('❌ Reconnect failed:', error.message)
+    }
+  } else {
+    console.error('❌ Max reconnect attempts reached. Manual restart required.')
+  }
 })
 
 // =====================================
@@ -1353,8 +1518,22 @@ client.on('message', async (message) => {
     // UNKNOWN - silently ignore or respond
     
   } catch (error) {
-    console.error('Error:', error)
-    await message.reply('❌ Terjadi kesalahan. Coba lagi nanti.')
+    const isContextDestroyed = error.message?.includes('Execution context was destroyed') ||
+                                error.message?.includes('Protocol error') ||
+                                error.message?.includes('Target closed') ||
+                                error.message?.includes('Session closed')
+    
+    console.error('❌ Message handler error:', error.message)
+    
+    if (isContextDestroyed) {
+      console.log('🔄 Context destroyed detected, marking client as not ready...')
+      clientReady = false
+      // Don't try to reply when context is destroyed, it will fail
+      return
+    }
+    
+    // Try to send error message using safe reply
+    await safeReply(message, '❌ Terjadi kesalahan. Coba lagi nanti.')
   }
 })
 
@@ -1546,14 +1725,14 @@ cron.schedule('0 8 * * *', async () => {
       
       // Send alert if > 80%
       if (percentage >= 90) {
-        await client.sendMessage(`${phone}@c.us`, 
+        await safeSendMessage(`${phone}@c.us`, 
           `🚨 *PERINGATAN BUDGET!*\n\n` +
           `Budget kamu sudah terpakai *${percentage}%*!\n` +
           `💰 Sisa: ${formatCurrency(budget - spent)}\n\n` +
           `_Hemat-hemat ya!_ 💪`
         )
       } else if (percentage >= 80) {
-        await client.sendMessage(`${phone}@c.us`, 
+        await safeSendMessage(`${phone}@c.us`, 
           `⚠️ *Hati-hati!*\n\n` +
           `Budget sudah terpakai *${percentage}%*\n` +
           `💰 Sisa: ${formatCurrency(budget - spent)}\n\n` +
@@ -1578,7 +1757,7 @@ cron.schedule('0 8 * * *', async () => {
     for (const reminder of reminders) {
       if (reminder.day === today) {
         try {
-          await client.sendMessage(`${phone}@c.us`, 
+          await safeSendMessage(`${phone}@c.us`, 
             `🔔 *Pengingat Tagihan*\n\n` +
             `📝 *${reminder.name}*\n` +
             `📅 Hari ini tanggal ${today}\n\n` +
@@ -1630,7 +1809,7 @@ cron.schedule('0 21 * * *', async () => {
           categoryList += `• ${cat}: ${formatCurrency(amt)}\n`
         })
       
-      await client.sendMessage(`${phone}@c.us`, 
+      await safeSendMessage(`${phone}@c.us`, 
         `📊 *Ringkasan Hari Ini*\n` +
         `📅 ${today}\n\n` +
         `📝 Transaksi: ${txs.length}\n` +
@@ -1679,7 +1858,7 @@ cron.schedule('0 7 * * *', async () => {
       
       const challenge = getDailyChallenge()
       
-      await client.sendMessage(`${phone}@c.us`, 
+      await safeSendMessage(`${phone}@c.us`, 
         `☀️ *Selamat Pagi!*\n\n` +
         `💰 Sisa budget: *${formatCurrency(remaining)}*\n\n` +
         `🎯 *Tantangan Hari Ini:*\n"${challenge.text}"\n\n` +
@@ -1705,7 +1884,7 @@ cron.schedule('0 18 * * *', async () => {
     try {
       const tip = getRandomTip()
       
-      await client.sendMessage(`${phone}@c.us`, 
+      await safeSendMessage(`${phone}@c.us`, 
         `🌅 *Tips Sore*\n\n` +
         `${tip}\n\n` +
         `_Sudah catat pengeluaran hari ini?_`
@@ -1724,6 +1903,7 @@ console.log('\n🚀 Starting WhatsApp Budget Bot...')
 console.log('📁 Auth data:', './.wwebjs_auth')
 console.log('📊 Features: Chart, Export, Gamification, Smart Alerts, Reminders')
 console.log('🎮 Gamification: Challenges, Health Score, Mood, Tips')
+console.log('🏥 Health Check: Every 30s with 5 retries')
 console.log('⏰ Cron Jobs:')
 console.log('   - 07:00: Good Morning + Challenge')
 console.log('   - 08:00: Budget Alert + Bill Reminders')
@@ -1731,4 +1911,28 @@ console.log('   - 18:00: Evening Tips')
 console.log('   - 21:00: Daily Summary')
 console.log('')
 
+// Graceful shutdown handlers
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down gracefully...')
+  stopHealthCheck()
+  try {
+    await client.destroy()
+  } catch (e) {
+    console.error('Error destroying client:', e.message)
+  }
+  process.exit(0)
+})
+
+process.on('SIGTERM', async () => {
+  console.log('\n🛑 SIGTERM received, shutting down...')
+  stopHealthCheck()
+  try {
+    await client.destroy()
+  } catch (e) {
+    console.error('Error destroying client:', e.message)
+  }
+  process.exit(0)
+})
+
 client.initialize()
+
